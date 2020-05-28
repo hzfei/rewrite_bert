@@ -162,4 +162,266 @@ class Transformer(object):#各种bert系列模型的基类
         """
         return {}
     
+    def load_weights_from_checkpoint(self,checkpoint,mapping=None):
+        mapping = mapping or self.variable_mapping()
+        mapping = {k:v for k,v in mapping.items() if k in self.layers}
+        
+        weights_value_pairs = []
+        
+        for layer,variables in mapping.items():
+            layer = self.layers[layer]
+            weights = layer.traiable_weights
+            values = [self.load_variable(checkpoint,v) for v in variables]
+            
+            if isinstance(layer, MultiHeadAttention):#这个以后再看...
+                """如果key_size不等于head_size，则可以通过
+                正交矩阵将相应的权重投影到合适的shape。
+                """
+                count = 2
+                if layer.use_bias:
+                    count += 2
+                heads = self.num_attention_heads
+                head_size = self.attention_head_size
+                key_size = self.attention_key_size
+                W = np.linalg.qr(np.random.randn(key_size, head_size))[0].T
+                if layer.attention_scale:
+                    W = W * key_size**0.25 / head_size**0.25
+                for i in range(count):
+                    w, v = weights[i], values[i]
+                    w_shape, v_shape = K.int_shape(w), v.shape
+                    if w_shape[-1] != v_shape[-1]:
+                        pre_shape = w_shape[:-1]
+                        v = v.reshape(pre_shape + (heads, head_size))
+                        v = np.dot(v, W)
+                        v = v.reshape(pre_shape + (heads * key_size,))
+                        values[i] = v
+            
+            weights_value_pairs.extend(zip(weights,values))
+        K.batch_set_value(weights_value_pairs)
+        
+    def save_weights_as_checkpoint(self, filename, mapping=None):#以后再看这个方法...
+        """根据mapping将权重保存为checkpoint格式
+        """
+        mapping = mapping or self.variable_mapping()
+        mapping = {k: v for k, v in mapping.items() if k in self.layers}
+
+        with tf.Graph().as_default():
+            for layer, variables in mapping.items():
+                layer = self.layers[layer]
+                values = K.batch_get_value(layer.trainable_weights)
+                for name, value in zip(variables, values):
+                    self.create_variable(name, value)
+            with tf.Session() as sess:
+                sess.run(tf.global_variables_initializer())
+                saver = tf.train.Saver()
+                saver.save(sess, filename, write_meta_graph=False)
+
+class Bert(Transformer):
+    def __init__(self,
+                 max_position,
+                 with_pool=False,
+                 with_nsp=False,
+                 with_mlm=False,
+                 custom_position_ids=False,
+                 **kwargs):
+        super(Bert,self).__init__(**kwargs)
+        self.max_position = max_position
+        self.with_pool = with_pool
+        self.with_nsp = with_nsp
+        self.with_mlm = with_mlm
+        self.custom_position_ids = custom_position_ids
     
+    def get_inputs(self):
+        x_in = Input(shape=(self.sequence_length,),name='Input-Token')
+        y_in = Input(shape=(self.sequence_length,),name='Input-Segment')
+        if self.custom_position_ids:
+            p_in = Input(shape=(self.sequence_length,),name='Input-Position')
+            return [x_in,y_in,p_in]
+        return [x_in,y_in]
+    
+    def apply_embedding(self,inputs):
+        x,s = inputs[:2]
+        z = self.layer_norm_conds[0]
+        if self.custom_position_ids:
+            p = inputs[2]
+        else:
+            p = None
+        x = self.apply(
+                        inputs=x,
+                        layer=Embeddding,
+                        input_dim = self.vocab_size,
+                        output_dim = self.embedding_size,
+                        embedding_initializer = self.initializer,
+                        mask_zero=True,
+                        name='Embedding-Token'
+                       )
+        
+        s = self.apply(
+                        inputs=s,
+                        layer=Embedding,
+                        input_dim = 2,
+                        output_dim = self.embedding_size,
+                        embedding_initializer = self.initializer,
+                        name = 'Embedding-Segment'
+                      )
+        
+        x = self.apply(inputs=[x,s],layer=Add,name='Embedding-Token_Segment')
+        
+        x = self.apply(
+                        inputs=x,
+                        layer=PositionEmbedding,
+                        input_dim=self.max_position,
+                        output_dim = self.embedding_size,
+                        merge_mode = 'add',
+                        embedding_initializer = self.initializer,
+                        custom_position_ids = self.custom_position_ids,
+                        name='Embedding-Position'
+                       )
+        
+        x = self.apply(
+                        inputs=x,
+                        layer=LayerNormalization,
+                        conditional=(z is not None),
+                        hidden_units=self.layer_norm_conds[1],
+                        hidden_activation=self.layer_norm_conds[2],
+                        hidden_initializer=self.initializer,
+                        name='Embedding-Norm'
+                      )
+        
+        x = self.apply(
+                        inputs=x,
+                        layer=Dropout,
+                        rate=self.dropout_rate,
+                        name='Embedding-Dropout'
+                
+                     )
+        
+        if self.embedding_size != self.hidden_size:
+            x = self.apply(
+                            inputs=x,
+                            layers=Dense,
+                            units=self.hidden_size,
+                            kernel_initializer=self.initializer,
+                            name='Embedding-Mapping'
+                          )
+        return x
+    
+    def apply_main_layers(self,inputs,index):
+        x = inputs
+        z = self.layer_norm_conds[0]
+        
+        attention_name = 'Transfomer-{}-MultiHeadSelfAttention'.format(index)
+        feed_forward_name = 'Transformer-{}-FeedForward'.format(index)
+        attention_mask = self.compute_attention_mask(index)
+        
+        xi,x,arguments = x,[x,x,x],{'a_mask':None}
+        
+        if attention_mask is not None:
+            arguments['a_mask'] = True
+            x.append(attention_mask)
+        
+        x = self.apply(
+                        inputs=x,
+                        layer=MultiHeadAttention,
+                        arguments=arguments,
+                        heads=self.num_attention_heads,
+                        head_size = self.attention_head_size,
+                        key_size=self.attention_key_size,
+                        kernel_initializer=self.initializer,
+                        name=attention_name
+                      )
+        
+        x = self.apply(
+                        inputs=x,
+                        layer=Dropout,
+                        rate=self.dropout_rate,
+                        name='{}-Dropout'.format(attention_name)
+                      )
+        
+        x = self.apply(
+                        inputs=[xi,x],
+                        layer=Add,
+                        name='{}-Add'.format(attention_name)
+                    )
+        
+        x = self.apply(
+                        inputs=self.simplify([x,z]),
+                        layer=LayerNormalization,
+                        layer=LayerNormalization,
+                        conditional=(z is not None),
+                        hidden_units=self.layer_norm_conds[1],
+                        hidden_activation=self.layer_norm_conds[2],
+                        hidden_initializer=self.initializer,
+                        name='%s-Norm' % attention_name
+                        )
+        
+        xi = x
+        
+        x = self.apply(
+                        inputs=x,
+                        layer=FeedForward,
+                        units=self.intermediate_size,
+                        activation=self.hidden_act,
+                        kernel_initializer=self.initializer,
+                        name=feed_forward_name
+                       )
+        
+        x = self.apply(
+                        inputs=x,
+                        layer=Dropout,
+                        rate=self.dropout_rate,
+                        name="{}-Dropout".format(feed_forward_name)
+                       )
+        
+        x = self.apply(
+                        inputs=[xi,x],
+                        layer=Add,
+                        name='{}-Add'.format(feed_forward_name)
+                      )
+        
+        x = self.apply(
+                        inputs=self.simplify([x, z]),
+                        layer=LayerNormalization,
+                        conditional=(z is not None),
+                        hidden_units=self.layer_norm_conds[1],
+                        hidden_activation=self.layer_norm_conds[2],
+                        hidden_initializer=self.initializer,
+                        name='%s-Norm' % feed_forward_name
+                     )
+        
+        return x
+    
+    def apply_final_layers(self,inputs):
+        x = inputs
+        z = self.layer_norm_conds[0]
+        outputs = [x]
+        
+        if self.with_pool or self.with_nsp:
+            x = outputs[0]
+            x = self.apply(
+                            inputs=x,
+                            layer=Lambda,
+                            function=lambda x:x[:,0],
+                            name='Pooler'
+                            )
+            pool_activation = 'tanh' if self.with_pool is True else self.with_pool
+            
+            x = self.apply(
+                            inputs=x,
+                            layer=Dense,
+                            units=self.hidden_size,
+                            activation=pool_activation,
+                            kernel_initializer=self.initializer,
+                            name='Pooler-Dense'
+                         )
+            
+            if self.with_nsp:
+                x = self.apply(
+                                inputs=x,
+                                layer=Dense,
+                                units=2,
+                                activation='softmax',
+                                kernel_initializer=self.initializer,
+                                name='NSP-Proba'
+                              )
+            outputs.append(x)
